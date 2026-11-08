@@ -12,23 +12,46 @@ const patienceMs = 5000, ocrAfterMs = 1000, ocrEveryMs = 2000, pollMs = 100, qui
 // cannot read at all is given this much more time before the search is called off.
 const ocrAllowanceMs = 12000;
 const strings = e => [e.label, e.text, e.value, e.identifier, e.placeholder].filter(v => typeof v === 'string');
-const normalize = v => v.normalize('NFKC').toLocaleLowerCase().trim();
+// A recognizer may put a space after every Chinese character it reads, and Windows OCR
+// also does it inside numbers and around punctuation ("微信 ( 714 )"). A caller never
+// writes those spaces, so a string that contains CJK is compared both as written and with
+// its whitespace removed. A Latin-only string keeps its word boundaries. Both sides carry
+// both forms, so a Latin query still matches a mixed label such as "Sign in 登录".
+const cjk = '\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff';
+const hasCjk = new RegExp(`[${cjk}]`, 'u');
+const forms = v => {
+  const n = v.normalize('NFKC').toLocaleLowerCase().trim();
+  return hasCjk.test(n) ? [n, n.replace(/\s+/gu, '')] : [n];
+};
+const normalize = v => forms(v).at(-1);
+const equalForms = (a, b) => a.some(form => b.includes(form));
+const includesForms = (haystack, needles) => haystack.some(hay => needles.some(needle => hay.includes(needle)));
 const visible = e => flagOn(e.visible);
-const alertText = v => v.normalize('NFD').replace(/\p{M}/gu, '').toLocaleLowerCase().trim().replace(/’/g, "'");
+// Alert and prompt text is compared against the Chinese entries in data/interaction.json, and
+// a recognizer writes spaces between those characters, so it needs the same normalisation as
+// every other comparison. Without it "允 许" never matched "允许", and a purchase prompt could
+// go unrecognised.
+const alertForms = v => forms(v.normalize('NFD').replace(/\p{M}/gu, '').replace(/’/g, "'"));
+const alertText = v => alertForms(v).at(-1);
 
 export function promptWarning(elements) {
-  const texts = elements.flatMap(strings).map(t => t.toLocaleLowerCase().trim());
-  const rule = behavior.prompt_detector.find(rule => texts.some(t => rule.exact.includes(t) || rule.contains.some(part => t.includes(part))));
+  const texts = elements.flatMap(strings).map(forms);
+  // The patterns in data/interaction.json are written the way a person writes them, so they go
+  // through the same normalisation as the text they are compared with.
+  const rule = behavior.prompt_detector.find(({ exact, contains }) => {
+    const wanted = exact.flatMap(forms), parts = contains.flatMap(forms);
+    return texts.some(t => equalForms(t, wanted) || includesForms(t, parts));
+  });
   return rule ? { kind: rule.name } : null;
 }
 
 export function matching(elements, value, exact = false) {
-  const needle = normalize(value);
-  if (!needle) throw new Error('Text must not be empty.');
+  const needle = forms(value);
+  if (!needle[0]) throw new Error('Text must not be empty.');
   // A phone lists the application itself first, covering the whole screen and named after the app.
   elements = elements.filter(e => visible(e) && (e.type ?? e.role) !== 'Application');
-  const full = elements.filter(e => strings(e).some(s => normalize(s) === needle));
-  return full.length || exact ? full : elements.filter(e => strings(e).some(s => normalize(s).includes(needle)));
+  const full = elements.filter(e => strings(e).some(s => equalForms(forms(s), needle)));
+  return full.length || exact ? full : elements.filter(e => strings(e).some(s => includesForms(forms(s), needle)));
 }
 
 const center = element => { const box = element.frame ?? element; return { x: box.x + box.width / 2, y: box.y + box.height / 2 }; };
@@ -617,10 +640,11 @@ export async function interaction(ctx, name, args) {
               instruction: 'Nothing was tapped. Confirm a purchase only when the user explicitly requested it, using button with the visible button text. Otherwise dismiss the prompt.' }
           : undefined;
         if (purchase) return shown.slice(0, 1);
-        const exact = label => shown.filter(e => strings(e).some(t => alertText(t) === alertText(label)));
+        const exact = label => shown.filter(e => strings(e).some(t => equalForms(alertForms(t), alertForms(label))));
         if (args.button) {
+          const want = alertForms(args.button);
           const candidates = exact(args.button);
-          return candidates.length ? candidates : shown.filter(e => strings(e).some(t => alertText(t).startsWith(alertText(args.button))));
+          return candidates.length ? candidates : shown.filter(e => strings(e).some(t => alertForms(t).some(form => want.some(prefix => form.startsWith(prefix)))));
         }
         for (const label of labels) {
           const candidates = exact(label);
